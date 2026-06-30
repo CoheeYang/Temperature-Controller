@@ -1,25 +1,33 @@
-/*
- * main.cpp — 输液瓶温控系统 (PID + 双 NTC + 三按键)
+﻿/*
+ * main.cpp 鈥?鍔犵儹绠￠亾娓╂帶绯荤粺 (PID + 4 璺祴娓?+ 涓夋寜閿?
  *
- * 功能:
- *   1) OLED 显示 CH1 / CH2 两路温度 (每 500ms 刷新)
- *   2) PID 闭环控制加热膜, 维持目标温度:
- *        引脚 D6 (P7 → U9 → CH4 MOSFET gate), 硬件 PWM ~1kHz
- *        目标温度默认 38°C, 可用按键调节 37~41°C
- *        控制温度 = max(CH1, CH2), 任一传感器失效则用另一路
- *        PID 参数 Kp=35.0, Ki=0.8, Kd=25.0 (实测最佳)
- *        PWM 占空比硬上限 = 50% (防止危险过热)
- *   3) 三个按键 (REQUIREMENTS.md §2.6):
- *        SW1=D2  →  目标温度 +0.5°C (上限 41°C)
- *        SW2=D3  →  目标温度 -0.5°C (下限 37°C)
- *        SW3=D4  →  切换 温控开/关 (按一次关闭, 再按启用)
- *        按键带上拉 + 软件消抖 (50ms)
- *   4) 安全保护:
- *        任一 NTC 短路/断路 → 立即切断加热
- *        温度 > 42℃ → 锁定加热, 降到 40℃ 才解锁
- *        双 NTC 故障 → 视为超温, 强制停机
+ * 2026-06-30 閲嶅ぇ鏂规鍙樻洿:
+ *   - 鏃ф柟妗?(PI 鍔犵儹鑶滃寘瑁圭洂姘寸摱) 宸插簾寮? 鍔犵儹閫熷害杩囨參
+ *   - 鏂版柟妗? 鐩愭按缁?鍔犵儹绠￠亾" 娴佸姩鍔犵儹, 闅旇啘娉?1~4 L/min
+ *   - 鍔犵儹鏉℃帴鍦?P6 (CH3 MOSFET D9), 鍘?P7 (CH4 D6) 宸叉嫈鎺?
+ *   - 鍔犵儹鏉″弬鏁? 24V/4A, 1400mm, 8.6惟, 鍐呯疆 2 璺?NTC (50K惟@25掳C)
  *
- *  串口波特率: 9600
+ * 4 璺?NTC 寮曡剼鏄犲皠:
+ *   CH1 = A0 (P3, 10k惟 鍒嗗帇)   鈥?绾祴閲? 涓嶅弬涓庢帶鍒?
+ *   CH2 = A1 (P2, 10k惟 鍒嗗帇)   鈥?绾祴閲? 涓嶅弬涓庢帶鍒?
+ *   CH3 = A2 (P8, 10k惟 鍒嗗帇)   鈥?鍔犵儹绠￠亾鍏ュ彛 NTC (50K惟) 鈽呭弬涓庢帶鍒?
+ *   CH4 = A3 (P9, 10k惟 鍒嗗帇)   鈥?鍔犵儹绠￠亾鍑哄彛 NTC (50K惟) 鈽呭弬涓庢帶鍒?
+ *
+ * 鎺у埗鐩爣:
+ *   - 鎺у埗娓╁害 = max(CH3, CH4), 浠讳竴澶辨晥鐢ㄥ彟涓€璺?
+ *   - PID 缁存寔姝ゆ渶澶у€艰揪鍒扮洰鏍囨俯搴?(榛樿 38掳C, 鎸夐敭 37~41掳C 鍙皟)
+ *   - PWM 鍗犵┖姣旂‖涓婇檺 = 80% (鍔犵儹鏉￠瀹?4A, 鍏佽鍔犲ぇ鍔熺巼)
+ *
+ * 涓夋寜閿?(REQUIREMENTS.md 搂2.6):
+ *   SW1=D2  鈫? 鐩爣娓╁害 +0.5掳C (涓婇檺 41掳C)
+ *   SW2=D3  鈫? 鐩爣娓╁害 -0.5掳C (涓嬮檺 37掳C)
+ *   SW3=D4  鈫? 鍒囨崲娓╂帶寮€/鍏?
+ *
+ * 瀹夊叏淇濇姢:
+ *   - 浠讳竴鎺у埗 NTC (CH3/CH4) 鏁呴殰 鈫?鍒囨柇鍔犵儹
+ *   - 娓╁害 > 42掳C 鈫?閿佸畾鍔犵儹, 闄嶅埌 40掳C 瑙ｉ攣
+ *
+ * 涓插彛娉㈢壒鐜? 9600
  */
 
 #include <Arduino.h>
@@ -29,88 +37,84 @@
 
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT 64
-#define OLED_RESET    -1        // -1 = 共享 Arduino RESET
-#define OLED_ADDR     0x3C      // 大多数 SSD1306 模块默认地址
+#define OLED_RESET    -1
+#define OLED_ADDR     0x3C
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// ===== NTC 参数 (来自 config.h / REQUIREMENTS.md) =====
-// CH1 接 A0 (P3, R3);  CH2 接 A1 (P2, R4);  CH3=A2(P8); CH4=A3(P9)
-// 分压: VCC - 10k - ADC - NTC - GND
-//        温度↑ → NTC阻值↓ → ADC值↓
-#define NTC_CH_COUNT    2                          // 当前启用 2 路
-const uint8_t NTC_PINS[NTC_CH_COUNT] = { A0, A1 }; // P3=CH1, P2=CH2
-const char*   NTC_NAMES[NTC_CH_COUNT] = { "CH1", "CH2" };
+// ===== NTC 鍙傛暟 (鏂板姞鐑潯鍐呯疆 NTC 瑙勬牸: 50K惟@25掳C 卤0.5%) =====
+// CH1=A0(P3, R3=10k), CH2=A1(P2, R4=10k), CH3=A2(P8, R14=10k), CH4=A3(P9, R15=10k)
+// 鍒嗗帇: VCC - 10k(鏉夸笂) - ADC - NTC - GND
+//        娓╁害鈫?鈫?NTC闃诲€尖啌 鈫?ADC鍊尖啌
+//
+// 鈿狅笍 娉ㄦ剰: 鏂板姞鐑潯鐨?NTC 鏍囩О 50K惟, 浣嗘澘涓婂垎鍘嬬數闃昏繕鏄?10k惟
+//   (R3/R4/R14/R15 鍏ㄦ槸 10k, 娌℃硶鍗曠嫭鍖哄垎 P8/P9)
+//   25掳C 鏃? ADC = 1023 脳 50/(50+10) 鈮?853 (楂樹綅, 娴嬮噺浠嶅噯纭?
+//   楂樻俯鏃? NTC 闄嶅埌鍑?k惟, ADC 姝ｅ父鍦ㄤ腑娈?
+//   鍏ㄩ儴閫氶亾鐢ㄧ粺涓€ R_REF=10K(鍒嗗帇鐢甸樆), NTC_R25 鎸?CH 绫诲瀷鍖哄垎
+#define NTC_CH_COUNT    4
+const uint8_t NTC_PINS[NTC_CH_COUNT] = { A0, A1, A2, A3 };   // P3, P2, P8, P9
+const char*   NTC_NAMES[NTC_CH_COUNT] = { "CH1", "CH2", "CH3", "CH4" };
 
-#define NTC_R25         10000.0f  // 25℃ 标称阻值 (Ω)
-#define NTC_B_VALUE     3950.0f   // B 值
-#define NTC_R_REF       10000.0f  // 分压电阻 (Ω)
-#define ADC_SHORT_THRESHOLD  20   // ADC < 20 → 短路
-#define ADC_OPEN_THRESHOLD   1000 // ADC > 1000 → 断路
-#define TEMP_OVERHEAT       62.0f // 超温硬切断阈值 (℃) ⚠️ 标定模式下提高到 62°C, 正常应恢复 42°C
+#define NTC_R_REF       10000.0f  // 鏉夸笂鍒嗗帇鐢甸樆 (惟, R3/R4/R14/R15 = 10k惟)
 
-// ===== 加热控制参数 =====
-// P7 → CH4 → U9(100N03) → D6 (REQUIREMENTS.md 表格确认)
-// D6 是 Arduino Nano 支持硬件 PWM 的引脚 (Timer0 OC0A),
-// 默认频率约 980Hz ≈ 1kHz, 用 analogWrite 直接输出
-#define HEATER_PIN            6       // 加热膜 PWM 引脚 (P7=CH4)
-// 自适应占空比上限: 误差大时(RAM阶段) 允许更猛, 接近目标时收回防过冲
-#define PWM_BOOST_THRESHOLD   2.0f    // 误差≥2°C 时启动 boost
-#define PWM_NORMAL_PERCENT    50      // 稳态占空比上限 (防过冲危险)
-#define PWM_BOOST_PERCENT     80      // 大误差时(标定提速用) 临时放宽到 80%
-#define PWM_NORMAL_ANALOG     ((PWM_NORMAL_PERCENT * 255) / 100)  // 127
-#define PWM_BOOST_ANALOG      ((PWM_BOOST_PERCENT  * 255) / 100)  // 204
+// 閫氶亾 1/2: P3/P2 鑷充粖鐢ㄧ殑浠嶅彲鑳芥槸鏃ф 10K惟 浼犳劅鍣? 閫氶亾 3/4 鏄閬?50K惟
+// 杩欓噷鐢ㄦ瘡閫氶亾鐙珛鐨勬爣绉伴樆鍊?
+const float   NTC_R25[NTC_CH_COUNT]      = { 10000.0f, 10000.0f, 50000.0f, 50000.0f }; // CH3/CH4=50K(绠￠亾鍐呯疆)
+const float   NTC_B_VALUE[NTC_CH_COUNT]  = { 3950.0f,  3950.0f,  3950.0f,  3950.0f  }; // B 鍊? 鏈疄娴嬪厛鐢ㄧ浉鍚?
 
-// ===== PID 参数 (来自 config.h, PID 整定前的初值) =====
-#define PID_KP          35.0f    // 比例系数
-#define PID_KI          0.8f     // 积分系数 (小, 防积分饱和超调)
-#define PID_KD          25.0f    // 微分系数 (强阻尼对抗热惯性)
-// PID 输出上限是动态的: 在 pidCompute 内根据 error 选择, 默认稳态 == PWM_NORMAL_ANALOG
-#define PID_OUTPUT_NORMAL  PWM_NORMAL_ANALOG  // 127 (稳态, 兼容其它引用)
-#define PID_OUTPUT_MAX     PID_OUTPUT_NORMAL  // 文档/老代码兼容 (实际可放宽见 pidCompute)
+#define ADC_SHORT_THRESHOLD  20   // ADC < 20 鈫?NTC 鐭矾
+#define ADC_OPEN_THRESHOLD   1000 // ADC > 1000 鈫?NTC 鏂矾 (鐣欎綑閲?
+#define TEMP_OVERHEAT        42.0f // 瓒呮俯闃堝€?(鈩? 鎺у埗 NTC 娓╁害)
 
-// ===== 目标温度 (变量, 可被按键修改) =====
-// ⚠️ 标定实验模式: 范围扩大到 37~60°C (临时, 用于实测"瓶身→瓶口"温度补偿 offset)
-//    标定方法: 外接温度计查瓶口实际温度, 与 PID 稳态 setpoint 对比,
-//              取多组数据拟合 offset = T瓶口 - T瓶身NTC
-//    标定完成后应恢复到 37~41°C, 把offset 硬编码进 adcToTempC
+// ===== 鍔犵儹鎺у埗鍙傛暟 =====
+// 鍔犵儹鏉℃帴 P6 鈫?U8 (100N03) MOSFET 鈫?D9 (PWM3, 寮曡剼 9)
+// 鈿狅笍 鏃у紩鑴?D6/P7 宸插簾寮? 鐣欑┖ (浠ｇ爜涓嶅啀寮曠敤)
+#define HEATER_PIN            9       // 鍔犵儹绠￠亾 MOSFET gate 寮曡剼 (P6=CH3)
+// PWM 鍗犵┖姣旂‖涓婇檺 = 80% (鍔犵儹鏉￠瀹?24V/4A, 鍏佽鍔犲ぇ鍔熺巼淇濊瘉鍗囨俯閫熷害)
+#define PWM_DUTY_MAX_PERCENT  80
+#define PWM_DUTY_MAX_ANALOG   ((PWM_DUTY_MAX_PERCENT * 255) / 100)  // = 204
+
+// ===== PID 鍙傛暟 (娌跨敤鏃х増绋冲畾鍙傛暟 Kp=35 Ki=0.8 Kd=25, 鍙﹂渶閲嶆柊鏁村畾) =====
+#define PID_KP          35.0f
+#define PID_KI          0.8f
+#define PID_KD          25.0f
+#define PID_OUTPUT_MAX  PWM_DUTY_MAX_ANALOG  // PID 杈撳嚭涓婇檺 = 204 (= 80%)
+
+// ===== 鐩爣娓╁害 (鍙橀噺, 鍙鎸夐敭淇敼) =====
 #define TEMP_MIN         37.0f
-#define TEMP_MAX         60.0f     // ⚠️ 标定模式上限扩大至 60°C
+#define TEMP_MAX         41.0f
 #define TEMP_STEP        0.5f
 #define TEMP_DEFAULT     38.0f
-float  tempSetpoint = TEMP_DEFAULT;   // 当前目标温度 (按键可调)
+float  tempSetpoint = TEMP_DEFAULT;
 
-// ===== 按键定义 (REQUIREMENTS.md §2.6 三个按键) =====
-// SW1=D2(目标温度+0.5), SW2=D3(目标温度-0.5), SW3=D4(开/关温控)
-// 电路: 按下=GND(低电平), 松开=VCC(高电平, 经10k上拉)
+// ===== 鎸夐敭瀹氫箟 =====
 #define BTN_COUNT        3
 const uint8_t BTN_PINS[BTN_COUNT]  = { 2, 3, 4 };
 const char*   BTN_NAMES[BTN_COUNT] = { "SW1(+0.5)", "SW2(-0.5)", "SW3(Pwr)" };
-#define BTN_DEBOUNCE_MS  50      // 消抖延时 (ms)
-bool btnPrev[BTN_COUNT]       = { false, false, false };  // 上次按键状态(true=按下)
-unsigned long btnLastEdge[BTN_COUNT] = {0, 0, 0};          // 上次电平跳变时刻
+#define BTN_DEBOUNCE_MS  50
+bool btnPrev[BTN_COUNT]       = { false, false, false };
+unsigned long btnLastEdge[BTN_COUNT] = {0, 0, 0};
 
-// PID 运行状态
-float         pidIntegral   = 0.0f;   // 积分累计 (带抗饱和)
-float         pidLastError  = 0.0f;   // 上次误差 (微分先行)
-int           pidOutput     = 0;      // PID 当前输出 (0~127)
-bool          pidOverheatLock = false; // 超温锁定 (需降温才解锁)
-unsigned long pidLastTime  = 0;      // 上次 PID 计算时刻
+// PID 杩愯鐘舵€?
+float         pidIntegral    = 0.0f;
+float         pidLastError   = 0.0f;
+int           pidOutput      = 0;
+bool          pidOverheatLock = false;
+unsigned long pidLastTime    = 0;
 
-// 温控使能开关 (SW3 切换)
-bool          systemEnabled = true;   // false → 关闭温控 (停止加热, 但仍显示温度)
-bool          heaterOn      = true;   // 本周期是否真在加热 (用于状态显示和故障检测)
+bool          systemEnabled  = true;  // 娓╂帶浣胯兘 (SW3 鍒囨崲)
 
-// ADC 滤波缓冲 (每通道一个)
+// ADC 婊ゆ尝缂撳啿 (姣忛€氶亾涓€涓?
 #define NTC_FILTER_SIZE 8
 uint16_t adcBuf[NTC_CH_COUNT][NTC_FILTER_SIZE];
-uint8_t  adcIdx[NTC_CH_COUNT] = {0};
-bool     adcFull[NTC_CH_COUNT] = {false};
+uint8_t  adcIdx[NTC_CH_COUNT]  = {0, 0, 0, 0};
+bool     adcFull[NTC_CH_COUNT] = {false, false, false, false};
 
-// 移动平均 + 防除零 (带通道号)
+// 绉诲姩骞冲潎 + 闃查櫎闆?(甯﹂€氶亾鍙?
 int readNtcAdc(uint8_t ch) {
     unsigned long sum = 0;
-    for (int i = 0; i < 4; i++) sum += analogRead(NTC_PINS[ch]); // 4连采
+    for (int i = 0; i < 4; i++) sum += analogRead(NTC_PINS[ch]);
     uint16_t raw = sum >> 2;
 
     adcBuf[ch][adcIdx[ch]] = raw;
@@ -124,33 +128,28 @@ int readNtcAdc(uint8_t ch) {
     return (int)(total / n);
 }
 
-// 返回状态: 0=正常, 1=短路, 2=断路
+// 杩斿洖鐘舵€? 0=姝ｅ父, 1=鐭矾, 2=鏂矾
 int checkNtc(int adc) {
     if (adc < ADC_SHORT_THRESHOLD) return 1;
     if (adc > ADC_OPEN_THRESHOLD)  return 2;
     return 0;
 }
 
-// ADC → 温度(℃), B 值简化公式
-float adcToTempC(int adc) {
+// ADC 鈫?娓╁害(鈩?, B 鍊煎叕寮? 鎸夐€氶亾鐢ㄤ笉鍚?R25
+float adcToTempC(uint8_t ch, int adc) {
     if (adc <= 0)    adc = 1;
     if (adc >= 1023) adc = 1022;
 
     float rNtc = NTC_R_REF * (float)adc / (1023.0f - (float)adc);
-    float steinhart = log(rNtc / NTC_R25);
-    float tempK = 1.0f / (1.0f / 298.15f + steinhart / NTC_B_VALUE);
+    float steinhart = log(rNtc / NTC_R25[ch]);
+    float tempK = 1.0f / (1.0f / 298.15f + steinhart / NTC_B_VALUE[ch]);
     return tempK - 273.15f;
 }
 
 /* ================================================================
- * PID 计算: 返回 PWM 输出值 (0~127)
- *   - 目标温度 = TEMP_SETPOINT
- *   - 输入 = 当前温度, dt = 时间间隔(秒)
- *   - 超温 (>42℃) 锁定: 输出强制 0, 直到温度降到 40℃ 以下解锁
- *   - 输出上限 = 127 (PWM 50%), 抗积分饱和
+ * PID 璁＄畻: 杩斿洖 PWM 杈撳嚭鍊?(0~204)
  * ============================================================== */
 int pidCompute(float temp, float dt) {
-    // 超温锁定机制 (迟滞: 上限 42℃ 触发, 下限 40℃ 解锁)
     if (temp >= TEMP_OVERHEAT) {
         pidOverheatLock = true;
         pidIntegral = 0.0f;
@@ -158,54 +157,44 @@ int pidCompute(float temp, float dt) {
     }
     if (pidOverheatLock) {
         if (temp < (TEMP_OVERHEAT - 2.0f)) {
-            pidOverheatLock = false;   // 温度回落到 40℃ → 解锁
+            pidOverheatLock = false;
         } else {
-            return 0;                  // 锁定期间输出 0
+            return 0;
         }
     }
 
-    // ===== PID 三项计算 =====
-    float error = tempSetpoint - temp;   // 正误差 = 偏冷, 需加热
+    float error = tempSetpoint - temp;
 
-    // 自适应输出上限: 大误差时(boost 阶段) 放宽到 PWM_BOOST_ANALOG
-    //                  接近目标(稳态) 保持在 PWM_NORMAL_ANALOG
-    float outMax = (error > PWM_BOOST_THRESHOLD) ? PWM_BOOST_ANALOG : PWM_NORMAL_ANALOG;
-
-    // P: 比例
+    // P: 姣斾緥
     float pTerm = PID_KP * error;
 
-    // I: 积分 (条件积分 + 加速回退, 彻底防饱和)
-    //   ① 大误差(>1.5°C, 处于 ramp 阶段) → 不累加, 避免爬升时积分膨胀
-    //   ② 温度超目标(error<0) → 3 倍速衰减, 快速纠正冲温
-    //   ③ 接近目标(0~1.5°C) → 正常累加, 消除稳态误差
-    //   ④ 范围夹到 [0, PWM_NORMAL_ANALOG * 0.5], 积分在稳态承担小份额
-    const float INTEGRAL_MAX = (float)PWM_NORMAL_ANALOG * 0.5f;  // 积分上限 = 63
+    // I: 鏉′欢绉垎 (闃查ケ鍜?
+    const float INTEGRAL_MAX = (float)PID_OUTPUT_MAX * 0.5f;
     if (error > 1.5f) {
-        // ramp 阶段不积分, 等 P 项主导升温
+        // ramp 闃舵涓嶇Н鍒?
     } else if (error < 0.0f) {
-        // 超温: 3 倍速衰减积分, 砍掉 ramp 时拉下的尾巴
+        // 瓒呮俯: 3 鍊嶉€熻“鍑忕Н鍒?
         float decay = PID_KI * error * dt * 3.0f;
         pidIntegral += decay;
         if (pidIntegral < 0.0f) pidIntegral = 0.0f;
     } else {
-        // 接近目标, 正常积分 (仅在 P+I 还没饱和时)
+        // 鎺ヨ繎鐩爣, 姝ｅ父绉垎 (浠呭湪 P+I 杩樻病楗卞拰鏃?
         float tentativeI = pidIntegral + PID_KI * error * dt;
         float pPlusI = pTerm + tentativeI;
-        if (pPlusI < outMax) {
+        if (pPlusI < (float)PID_OUTPUT_MAX) {
             pidIntegral = tentativeI;
         }
         if (pidIntegral > INTEGRAL_MAX) pidIntegral = INTEGRAL_MAX;
     }
 
-    // D: 微分先行 (减少设定值突变的冲击)
+    // D: 寰垎鍏堣
     float dTerm = PID_KD * (pidLastError - error) / dt;
     pidLastError = error;
 
-    // 合成 + 限幅到 [0, outMax] (动态上限)
+    // 鍚堟垚 + 闄愬箙
     float rawOut = pTerm + pidIntegral + dTerm;
     if (rawOut < 0.0f) rawOut = 0.0f;
-    if (rawOut > outMax) rawOut = outMax;
-
+    if (rawOut > (float)PID_OUTPUT_MAX) rawOut = (float)PID_OUTPUT_MAX;
     return (int)rawOut;
 }
 
@@ -216,26 +205,21 @@ void pidReset() {
 }
 
 /* ================================================================
- * 按键扫描: 带消抖, 检测"按下边沿"(从松→按)
- *   返回值为本次刚按下的按键索引: 0=SW1, 1=SW2, 2=SW3, 255=无
+ * 鎸夐敭鎵弿 (杩斿洖鍒氭寜涓嬬殑鎸夐敭绱㈠紩鎴?255=鏃?
  * ============================================================== */
 uint8_t scanButtons() {
     uint8_t pressed = 255;
     for (uint8_t i = 0; i < BTN_COUNT; i++) {
-        bool nowDown = (digitalRead(BTN_PINS[i]) == LOW);  // 低电平=按下
+        bool nowDown = (digitalRead(BTN_PINS[i]) == LOW);
         if (nowDown != btnPrev[i]) {
-            btnLastEdge[i] = millis();        // 记下电平跳变时刻
+            btnLastEdge[i] = millis();
         }
         btnPrev[i] = nowDown;
 
-        // 跳变后稳定超过 BTN_DEBOUNCE_MS 才认为有效
         if (nowDown && (millis() - btnLastEdge[i] >= BTN_DEBOUNCE_MS)) {
-            // 标记为"已处理", 防止长按重复触发
-            // 用一个 hack: 把 btnLastEdge 置为 0, 直到松开 (nowDown=false) 才能再次触发
             if (btnLastEdge[i] != 0) {
                 pressed = i;
-                btnLastEdge[i] = 0;  // 锁死, 直到释放
-                // 注意: 这里只返回一个按键, 优先级按 i 顺序
+                btnLastEdge[i] = 0;
             }
         }
     }
@@ -243,28 +227,24 @@ uint8_t scanButtons() {
 }
 
 /* ================================================================
- * 按键事件处理
- *   SW1(D2): 目标温度 +0.5°C (上限 41°C)
- *   SW2(D3): 目标温度 -0.5°C (下限 37°C)
- *   SW3(D4): 切换 温控开/关
+ * 鎸夐敭浜嬩欢澶勭悊
  * ============================================================== */
 void handleButton(uint8_t btnIdx) {
     if (btnIdx >= BTN_COUNT) return;
-
     Serial.print(F("[BTN] ")); Serial.print(BTN_NAMES[btnIdx]);
 
     switch (btnIdx) {
-        case 0: {  // SW1: +0.5°C
+        case 0: {  // SW1: +0.5掳C
             float newT = tempSetpoint + TEMP_STEP;
             if (newT > TEMP_MAX) newT = TEMP_MAX;
             if (newT != tempSetpoint) {
                 tempSetpoint = newT;
-                pidReset();   // 目标变了, 清积分避免冲击
+                pidReset();
             }
             Serial.print(F(" TempUp -> ")); Serial.print(tempSetpoint); Serial.println(F("C"));
             break;
         }
-        case 1: {  // SW2: -0.5°C
+        case 1: {  // SW2: -0.5掳C
             float newT = tempSetpoint - TEMP_STEP;
             if (newT < TEMP_MIN) newT = TEMP_MIN;
             if (newT != tempSetpoint) {
@@ -274,10 +254,10 @@ void handleButton(uint8_t btnIdx) {
             Serial.print(F(" TempDown -> ")); Serial.print(tempSetpoint); Serial.println(F("C"));
             break;
         }
-        case 2: {  // SW3: 切换温控开/关
+        case 2: {  // SW3: 鍒囨崲娓╂帶寮€/鍏?
             systemEnabled = !systemEnabled;
             if (!systemEnabled) {
-                analogWrite(HEATER_PIN, 0);   // 关温控时立即停止加热
+                analogWrite(HEATER_PIN, 0);
                 pidOutput = 0;
                 pidReset();
             }
@@ -288,241 +268,195 @@ void handleButton(uint8_t btnIdx) {
     }
 }
 
-// 扫描 I2C 总线, 打印所有应答地址
-void scanI2C() {
-    Serial.println(F("--- I2C Bus Scan ---"));
-    byte count = 0;
-    for (byte addr = 1; addr < 127; addr++) {
-        Wire.beginTransmission(addr);
-        byte err = Wire.endTransmission();
-        if (err == 0) {
-            Serial.print(F("Found device at 0x"));
-            if (addr < 16) Serial.print(F("0"));
-            Serial.println(addr, HEX);
-            count++;
-        }
-    }
-    Serial.print(F("Total devices found: "));
-    Serial.println(count);
-    if (count == 0) {
-        Serial.println(F("!! No I2C device found. Check wiring:"));
-        Serial.println(F("   VCC->5V, GND->GND, SDA->A4, SCL->A5"));
-    }
-    Serial.println(F("--------------------"));
-}
-
 /* ================================================================
- * 初始化
+ * 鍒濆鍖?
  * ============================================================== */
 void setup() {
     Serial.begin(9600);
-    while (!Serial);              // 等待串口就绪
+    while (!Serial);
 
-    Serial.println(F("\n=== OLED Minimal Test ==="));
-
-    // --- Step 1: I2C 扫描 ---
     Wire.begin();
-    scanI2C();
 
-    // --- Step 2: 初始化 OLED ---
-    Serial.println(F("Initializing SSD1306 @ 0x3C..."));
+    // --- 鍒濆鍖?OLED ---
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-        Serial.println(F("!! SSD1306 init FAILED"));
-        Serial.println(F("   If I2C scan found 0x3C, check reset pin / power."));
-        Serial.println(F("   Program will hang here."));
+        Serial.println(F("SSD1306 init FAILED"));
         while (true) { delay(1000); }
     }
-    Serial.println(F("SSD1306 init OK!"));
+    Serial.println(F("OLED OK"));
 
-    // --- 初始化 NTC 滤波缓冲 ---
+    // --- 鍒濆鍖?4 璺?NTC 婊ゆ尝缂撳啿 ---
     for (uint8_t ch = 0; ch < NTC_CH_COUNT; ch++) {
         pinMode(NTC_PINS[ch], INPUT);
     }
     memset(adcBuf, 0, sizeof(adcBuf));
 
-    // --- 初始化按键引脚 (SW1=D2/SW2=D3/SW3=D4, 输入上拉) ---
+    // 鈿狅笍 P7/D6 宸插簾寮?(鏃у姞鐑啘鏂规), 涓嶅啀鍒濆鍖栦负鍔犵儹杈撳嚭
+    // 浠呰涓?INPUT 闃叉鎮┖ (P7 鐜版槸绌烘彃搴?
+    pinMode(6, INPUT_PULLUP);
+
+    // --- 鍒濆鍖栨寜閿?---
     for (uint8_t i = 0; i < BTN_COUNT; i++) {
         pinMode(BTN_PINS[i], INPUT_PULLUP);
     }
-    Serial.println(F("Buttons: SW1(D2)+0.5, SW2(D3)-0.5, SW3(D4)Pwr"));
 
-    // --- 初始化加热引脚 (P7 → D6, PID 模式默认关闭, 等 PID 计算后输出) ---
+    // --- 鍒濆鍖栧姞鐑紩鑴?(P6 鈫?D9, PID 榛樿鍏抽棴) ---
     pinMode(HEATER_PIN, OUTPUT);
     analogWrite(HEATER_PIN, 0);
-    Serial.print(F("PID heater on pin D")); Serial.println(HEATER_PIN);
+    Serial.print(F("Heater (P6/D9, CH3 MOSFET), max "));
+    Serial.print(PWM_DUTY_MAX_PERCENT); Serial.println(F("%"));
     Serial.print(F("Setpoint=")); Serial.print(tempSetpoint);
     Serial.print(F("C  Kp=")); Serial.print(PID_KP);
     Serial.print(F(" Ki=")); Serial.print(PID_KI);
     Serial.print(F(" Kd=")); Serial.println(PID_KD);
+    Serial.println(F("CTRL: max(CH3, CH4)   CH1/CH2 monitor-only"));
     pidLastTime = millis();
 
-    // --- 显示固定标题 ---
+    // --- 寮€鏈烘爣璇?---
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(1);
     display.setCursor(0, 0);
-    display.println(F("NTC Temp Monitor"));
+    display.println(F("Heating Pipe"));
     display.setCursor(0, 12);
-    display.println(F("CH1 @ A0"));
-    display.setCursor(0, 24);
-    display.println(F("CH2 @ A1"));
-    display.setCursor(0, 40);
-    display.println(F("Reading..."));
+    display.println(F("4-ch NTC"));
+    display.setCursor(0, 28);
+    display.println(F("CTRL: CH3/CH4"));
     display.display();
-    Serial.println(F("Setup done. Reading NTC (2 channels)..."));
 }
 
 /* ================================================================
- * 主循环
- *   加热: 硬件 PWM (~1kHz) 全程自动输出, 这里只在故障时拉低关断
- *   500ms: 读 NTC + 安全检查 + OLED 刷新 + 串口打点
+ * 涓诲惊鐜?
  * ============================================================== */
 void loop() {
     unsigned long now = millis();
 
-    // ============ 每次循环: 扫按键 (实时响应) ============
+    // --- 鎵寜閿?(瀹炴椂鍝嶅簲) ---
     uint8_t btn = scanButtons();
-    if (btn < BTN_COUNT) {
-        handleButton(btn);
-    }
+    if (btn < BTN_COUNT) handleButton(btn);
 
-    // ============ 每 500ms: 读 NTC + 安全 + 屏幕 ============
+    // --- 姣?500ms 娴嬫俯 + 鎺у埗 + 鏄剧ず ---
     static unsigned long lastT = 0;
     if (now - lastT < 500) return;
     lastT = now;
 
-    // --- 读取两路 NTC ---
+    // --- 璇诲彇 4 璺?NTC ---
     int   adcs[NTC_CH_COUNT];
     int   faults[NTC_CH_COUNT];
     float temps[NTC_CH_COUNT];
-
     for (uint8_t ch = 0; ch < NTC_CH_COUNT; ch++) {
         adcs[ch]   = readNtcAdc(ch);
         faults[ch] = checkNtc(adcs[ch]);
-        temps[ch]  = (faults[ch] == 0) ? adcToTempC(adcs[ch]) : 0.0f;
+        temps[ch]  = (faults[ch] == 0) ? adcToTempC(ch, adcs[ch]) : 0.0f;
     }
 
-    // --- 安全检查: 任一通道故障 → 切断加热 ---
-    bool   emergency = false;
-    String reason    = "";
-    for (uint8_t ch = 0; ch < NTC_CH_COUNT; ch++) {
-        if (faults[ch] != 0) {
-            emergency = true;
-            reason   = String(NTC_NAMES[ch]) + (faults[ch] == 1 ? " SHORT" : " OPEN");
-            break;
-        }
+    // --- 瀹夊叏妫€鏌? 鎺у埗鐢?NTC (CH3/CH4) 浠讳竴鏁呴殰 鈫?鍒囨柇鍔犵儹 ---
+    //     CH1/CH2 鏄函娴嬮噺, 鏁呴殰涓嶅奖鍝嶆帶鍒? 鍙樉绀洪敊璇?
+    bool   ctrlEmergency = false;
+    String reason        = "";
+    if (faults[2] != 0) {
+        ctrlEmergency = true;
+        reason = String("CH3 ") + (faults[2] == 1 ? "SHORT" : "OPEN");
+    } else if (faults[3] != 0) {
+        ctrlEmergency = true;
+        reason = String("CH4 ") + (faults[3] == 1 ? "SHORT" : "OPEN");
     }
-    if (emergency && systemEnabled) {
-        heaterOn = false;   // 仅作为本周期标记使用, 保留逻辑兼容
+    if (ctrlEmergency) {
         analogWrite(HEATER_PIN, 0);
+        pidOutput = 0;
         pidReset();
-        Serial.print(F("!! SAFETY TRIP: ")); Serial.println(reason);
     }
 
-    // --- 计算控制目标温度 (两路取最大值, 一路故障用另一路) ---
+    // --- 璁＄畻鎺у埗鐩爣 = max(CH3, CH4), 涓€璺晠闅滅敤鍙︿竴璺?---
     float controlTemp;
-    if (faults[0] == 0 && faults[1] == 0) {
-        controlTemp = max(temps[0], temps[1]);
-    } else if (faults[0] == 0) {
-        controlTemp = temps[0];
-    } else if (faults[1] == 0) {
-        controlTemp = temps[1];
+    if (faults[2] != 0 && faults[3] != 0) {
+        controlTemp = TEMP_OVERHEAT;   // 鍙屾晠闅?鈫?瑙嗕负瓒呮俯
+    } else if (faults[2] != 0) {
+        controlTemp = temps[3];
+    } else if (faults[3] != 0) {
+        controlTemp = temps[2];
     } else {
-        controlTemp = TEMP_OVERHEAT;  // 双故障, 当作超温处理
+        controlTemp = max(temps[2], temps[3]);
     }
 
-    // --- 决定是否允许加热 ---
-    // 三个条件都满足才加热: ①系统使能(SW3) ②无传感器故障 ③未在超温锁定
-    bool allowHeat = systemEnabled && !emergency;   // 超温锁定由 pidCompute 内部处理
-
-    // --- PID 计算输出 ---
+    // --- PID 璁＄畻 + 杈撳嚭 ---
     float dt = (now - pidLastTime) / 1000.0f;
     pidLastTime = now;
-    if (!emergency) heaterOn = true;  // 故障恢复后允许加热
+    bool allowHeat = systemEnabled && !ctrlEmergency;
     if (allowHeat) {
         pidOutput = pidCompute(controlTemp, dt);
         analogWrite(HEATER_PIN, pidOutput);
     } else {
         pidOutput = 0;
         analogWrite(HEATER_PIN, 0);
-        // 关温控时不重置 PID, 重新启动时Smooth恢复 (可选)
     }
 
-    // --- 串口打点 ---
+    // --- 涓插彛鎵撶偣 ---
     for (uint8_t ch = 0; ch < NTC_CH_COUNT; ch++) {
         Serial.print(NTC_NAMES[ch]);
-        Serial.print(F(" ADC=")); Serial.print(adcs[ch]);
+        Serial.print(F("="));
         if (faults[ch] == 0) {
-            Serial.print(F(" Temp=")); Serial.print(temps[ch], 2); Serial.println(F("C"));
-        } else if (faults[ch] == 1) {
-            Serial.println(F(" [SHORT!]"));
+            Serial.print(temps[ch], 1);
+            Serial.print(F("C  "));
         } else {
-            Serial.println(F(" [OPEN!]"));
+            Serial.print(faults[ch] == 1 ? F("SHORT ") : F("OPEN  "));
         }
     }
-    Serial.print(F("CTRL temp=")); Serial.print(controlTemp, 2);
+    Serial.print(F("| Ctrl=")); Serial.print(controlTemp, 1);
     Serial.print(F("C Set=")); Serial.print(tempSetpoint, 1);
-    Serial.print(F(" PID=")); Serial.print(pidOutput);
+    Serial.print(F(" PWM=")); Serial.print(pidOutput);
     Serial.print(F("/")); Serial.print(PID_OUTPUT_MAX);
-    if (!systemEnabled) {
-        Serial.println(F(" (DISABLED)"));
-    } else if (!heaterOn || emergency) {
-        Serial.print(F(" (HALT: ")); Serial.print(reason); Serial.println(F(")"));
-    } else if (pidOverheatLock) {
-        Serial.println(F(" (OVERHEAT-LOCK)"));
-    } else {
-        Serial.println(F(" (HEATING)"));
-    }
+    if (!systemEnabled)       Serial.println(F(" OFF"));
+    else if (ctrlEmergency)   { Serial.print(F(" HALT ")); Serial.println(reason); }
+    else if (pidOverheatLock) Serial.println(F(" OVERHEAT-LOCK"));
+    else                      Serial.println(F(" HEAT"));
 
-    // --- 刷新 OLED (两路温度 + PID 状态) ---
+    // --- 鍒锋柊 OLED (4 璺?+ 鎺у埗鐘舵€? ---
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
 
-    // 标题 + 系统开关状态指示 + 心跳
+    // 鏍囬琛?(蹇冭烦 + 绯荤粺鐘舵€?
     display.setTextSize(1);
     display.setCursor(0, 0);
-    if (systemEnabled) {
-        display.println(F("Temp Control"));
-    } else {
-        display.println(F("TempCtrl [OFF]"));
-    }
+    display.println(systemEnabled ? F("Heater Pipe") : F("[OFF] Pipe"));
     static bool heart = false;
     heart = !heart;
     display.setCursor(120, 0);
     display.print(heart ? F("*") : F("."));
 
-    // 两路温度, y=12 / 24
+    // 4 璺?NTC, 2 鍒楀竷灞€ (CH1/CH2 涓€琛? CH3/CH4 涓€琛?
+    // y=12: CH1 宸?  CH2 鍙?
+    // y=24: CH3 宸?  CH4 鍙?(鎺у埗鐢?
     for (uint8_t ch = 0; ch < NTC_CH_COUNT; ch++) {
-        uint8_t y = 12 + ch * 12;
-        display.setCursor(0, y);
+        uint8_t y = 12 + (ch / 2) * 12;        // 琛?
+        uint8_t x = (ch % 2) ? 64 : 0;         // 鍒?
+        display.setCursor(x, y);
         display.print(NTC_NAMES[ch]);
-        display.print(F(": "));
+        display.print(F(":"));
         if (faults[ch] == 0) {
             display.print(temps[ch], 1);
-            display.print(F("C "));
-            display.print(adcs[ch]);
+            display.print(F("C"));
         } else {
-            display.print(faults[ch] == 1 ? F("SHORT!") : F("OPEN!"));
+            display.print(faults[ch] == 1 ? F("SHORT") : F("OPEN"));
         }
     }
 
-    // 目标 + 控制温度 y=40
+    // 鎺у埗鐩爣琛?y=40
     display.setCursor(0, 40);
-    display.print(F("Set "));   display.print(tempSetpoint, 1);
-    display.print(F(" Now "));  display.print(controlTemp, 1);
-    display.print(F("C"));
+    display.print(F("Set "));
+    display.print(tempSetpoint, 1);
+    display.print(F(" Ctrl "));
+    display.print(controlTemp, 1);
 
-    // PID 输出 + 状态, y=54
+    // PID 杈撳嚭 + 鐘舵€?y=54
     display.setCursor(0, 54);
     if (!systemEnabled) {
         display.print(F("POWERED OFF"));
-    } else if (emergency) {
-        display.print(F("HALT! "));
-        display.print(reason);
+    } else if (ctrlEmergency) {
+        display.print(F("HALT ")); display.print(reason);
     } else if (pidOverheatLock) {
         display.print(F("OVERHEAT LOCK"));
     } else {
-        int pct = (pidOutput * 100) / PID_OUTPUT_MAX;  // 当前占空比 / 50%档
+        int pct = (pidOutput * 100) / PID_OUTPUT_MAX;
         display.print(F("PWM "));
         display.print(pidOutput);
         display.print(F("/"));
@@ -534,4 +468,3 @@ void loop() {
 
     display.display();
 }
-
