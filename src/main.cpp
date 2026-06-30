@@ -168,17 +168,18 @@ int pidCompute(float temp, float dt) {
     // P: 姣斾緥
     float pTerm = PID_KP * error;
 
-    // I: 鏉′欢绉垎 (闃查ケ鍜?
-    const float INTEGRAL_MAX = (float)PID_OUTPUT_MAX * 0.5f;
+    // I: 条件积分 (防饱和) — 标定阶段允许积分达到满档
+    // (原版把积分砍半到 PID_OUTPUT_MAX*0.5, 导致 PID 输出永远撞不到上限)
+    const float INTEGRAL_MAX = (float)PID_OUTPUT_MAX;  // 积分上限 = 204
     if (error > 1.5f) {
-        // ramp 闃舵涓嶇Н鍒?
+        // ramp 阶段不积分
     } else if (error < 0.0f) {
-        // 瓒呮俯: 3 鍊嶉€熻“鍑忕Н鍒?
+        // 超温: 3 倍速衰减积分
         float decay = PID_KI * error * dt * 3.0f;
         pidIntegral += decay;
         if (pidIntegral < 0.0f) pidIntegral = 0.0f;
     } else {
-        // 鎺ヨ繎鐩爣, 姝ｅ父绉垎 (浠呭湪 P+I 杩樻病楗卞拰鏃?
+        // 接近目标, 正常积分 (仅在 P+I 还没饱和时)
         float tentativeI = pidIntegral + PID_KI * error * dt;
         float pPlusI = pTerm + tentativeI;
         if (pPlusI < (float)PID_OUTPUT_MAX) {
@@ -456,7 +457,8 @@ void loop() {
     } else if (pidOverheatLock) {
         display.print(F("OVERHEAT LOCK"));
     } else {
-        int pct = (pidOutput * 100) / PID_OUTPUT_MAX;
+        // 百分比以硬件 PWM 满档 255 为基准 (不是 PID 软上限 204)
+        int pct = (pidOutput * 100) / 255;
         display.print(F("PWM "));
         display.print(pidOutput);
         display.print(F("/"));
