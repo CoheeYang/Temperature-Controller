@@ -16,11 +16,11 @@
  * 
  * 控制目标:
  *   - 控制温度 = max(CH3, CH4), 任一失效用另一路
- *   - PID 维持此最大值达到目标温度 (默认 38°C, 按键 37~41°C 可调)
- *   - PWM 占空比硬上限 = 80% (加热条额定 4A, 允许加大功率)
+ *   - PID 维持此最大值达到目标温度 (默认 38°C, 按键 37~50°C 可调)
+ *   - PWM 占空比硬上限 = 80% (配合软启动, 兼顾升速与冲击限制)
  *
  * 三按键 (REQUIREMENTS.md §2.6):
- *   SW1=D2  →  目标温度 +0.5°C (上限 41°C)
+ *   SW1=D2  →  目标温度 +0.5°C (上限 50°C)
  *   SW2=D3  →  目标温度 -0.5°C (下限 37°C)
  *   SW3=D4  →  切换温控开/关
  *
@@ -66,16 +66,16 @@ const float   NTC_B_VALUE[NTC_CH_COUNT]  = { 3950.0f,  3950.0f,  3950.0f,  3950.
 
 #define ADC_SHORT_THRESHOLD  20   // ADC < 20 → NTC 短路
 #define ADC_OPEN_THRESHOLD   1000 // ADC > 1000 → NTC 断路 (留余量)
-#define TEMP_OVERHEAT        42.0f // 超温阈值 (°C, 控制 NTC 温度)
+#define TEMP_OVERHEAT        55.0f // 超温阈值 (°C, 给 TEMP_MAX=50°C 留 5°C 余量防锁定)
 
 // ===== 加热控制参数 =====
 // 加热条接 P6 → U8 (100N03) MOSFET → D9 (PWM3, 引脚 9)
 // ⚠️ 旧引脚 D6/P7 已废弃, 留空 (代码不再引用)
 #define HEATER_PIN            9       // 加热管道 MOSFET gate 引脚 (P6=CH3)
-// PWM 占空比硬上限 = 50% (实测见 80% 时开机即冲到 2~3A, 偏激进)
-//   加热条 8.6Ω @24V → 50% 平均电流 ~1.4A, 安全
-#define PWM_DUTY_MAX_PERCENT  50
-#define PWM_DUTY_MAX_ANALOG   ((PWM_DUTY_MAX_PERCENT * 255) / 100)  // = 127
+// PWM 占空比硬上限 = 80% (流动散热大, 50% 功率不足; 通过软启动限制开机冲击)
+//   加热条 8.6Ω @24V → 满档电流 ~2.8A, 80% 平均电流 ~2.2A (规格上限 4A, 安全)
+#define PWM_DUTY_MAX_PERCENT  80
+#define PWM_DUTY_MAX_ANALOG   ((PWM_DUTY_MAX_PERCENT * 255) / 100)  // = 204
 
 // ===== 软启动 (防止开机瞬间大电流冲击) =====
 // 前 SOFTSTART_DURATION_MS 毫秒内, 输出从 SOFTSTART_MIN_SCALE 线性爬到 100%
@@ -85,15 +85,17 @@ const float   NTC_B_VALUE[NTC_CH_COUNT]  = { 3950.0f,  3950.0f,  3950.0f,  3950.
 #define SOFTSTART_MIN_SCALE    0.20f  // 起始缩放 = 20% (PID 输出乘以这个系数)
 unsigned long bootTime = 0;            // 开机时刻 (在 setup 中记录)
 
-// ===== PID 参数 (沿用旧版稳定参数 Kp=35 Ki=0.8 Kd=25, 另需重新整定) =====
-#define PID_KP          35.0f
+// ===== PID 参数 (流动加热场景重整定: Kp 加大使小误差时仍有推力突破热平衡) =====
+// 2026-07-01 调整: 47.3°C 与 50°C 目标仅差 2.7, 但 Kp=35 时输出仅 95, 不足以突破散热
+//                  → Kp 提到 80, 同样 2.7°C 误差能推到 216→顶满 204; 让 PID 主动冲刺
+#define PID_KP          80.0f
 #define PID_KI          0.8f
 #define PID_KD          25.0f
-#define PID_OUTPUT_MAX  PWM_DUTY_MAX_ANALOG  // PID 输出上限 = 204 (= 80%)
+#define PID_OUTPUT_MAX  PWM_DUTY_MAX_ANALOG  // PID 输出上限 = 204 (= PWM 80%)
 
 // ===== 目标温度 (变量, 可被按键修改) =====
 #define TEMP_MIN         37.0f
-#define TEMP_MAX         41.0f
+#define TEMP_MAX         50.0f    // 调温上限 45 → 50°C (流动方案需更高目标 + 大功率)
 #define TEMP_STEP        0.5f
 #define TEMP_DEFAULT     38.0f
 float  tempSetpoint = TEMP_DEFAULT;
@@ -157,7 +159,7 @@ float adcToTempC(uint8_t ch, int adc) {
 }
 
 /* ================================================================
- * PID 计算: 返回 PWM 输出值 (0~204)
+ * PID 计算: 返回 PWM 输出值 (0~PID_OUTPUT_MAX = 0~204)
  * ============================================================== */
 int pidCompute(float temp, float dt) {
     if (temp >= TEMP_OVERHEAT) {
