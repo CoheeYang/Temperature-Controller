@@ -58,11 +58,12 @@ const char*   NTC_NAMES[NTC_CH_COUNT] = { "CH1", "CH2" };
 #define HEATER_PIN            6       // 加热膜 PWM 引脚 (P7=CH4)
 #define BUZZER_PIN            5       // 蜂鸣器引脚 (D5, BUZZER2: PB-1224PE-05Q 有源, 高电平响)
 // 自适应占空比上限: 误差大时(RAM阶段) 允许更猛, 接近目标时收回防过冲
-#define PWM_BOOST_THRESHOLD   2.0f    // 误差≥2°C 时启动 boost
-#define PWM_NORMAL_PERCENT    50      // 稳态占空比上限 (防过冲危险)
-#define PWM_BOOST_PERCENT     80      // 大误差时(标定提速用) 临时放宽到 80%
-#define PWM_NORMAL_ANALOG     ((PWM_NORMAL_PERCENT * 255) / 100)  // 127
-#define PWM_BOOST_ANALOG      ((PWM_BOOST_PERCENT  * 255) / 100)  // 204
+// ⚠️ 加热膜 24V/1A=24W, 实测热惯性大, 原 50%/80% 上限太保守导致中段爬不上去
+#define PWM_BOOST_THRESHOLD   3.0f    // 误差≥3°C 时启动 boost (原 2.0 提升到 3.0)
+#define PWM_NORMAL_PERCENT    70      // 稳态占空比上限 (原 50 → 70, 提高基础加热功率)
+#define PWM_BOOST_PERCENT     100     // 大误差时全开 100% (原 80 → 100), 快速冲温
+#define PWM_NORMAL_ANALOG     ((PWM_NORMAL_PERCENT * 255) / 100)  // 178
+#define PWM_BOOST_ANALOG      ((PWM_BOOST_PERCENT  * 255) / 100)  // 255
 
 // ===== PID 参数 (来自 config.h, PID 整定前的初值) =====
 #define PID_KP          35.0f    // 比例系数
@@ -102,6 +103,13 @@ unsigned long pidLastTime  = 0;      // 上次 PID 计算时刻
 // 温控使能开关 (SW3 切换)
 bool          systemEnabled = true;   // false → 关闭温控 (停止加热, 但仍显示温度)
 bool          heaterOn      = true;   // 本周期是否真在加热 (用于状态显示和故障检测)
+
+// ===== 4 小时自动关机 (从实际加热开始计时, 加热中断时暂停, 恢复时累加) =====
+#define AUTO_SHUTDOWN_MS  (4UL * 60UL * 60UL * 1000UL)  // 4 小时 = 14,400,000 ms
+unsigned long heatingAccumMs   = 0;   // 累计加热时长 (ms)
+unsigned long heatingStartMs   = 0;   // 本次连续加热段的起始时刻 (ms)
+bool          heatingTimerRunning = false;  // 加热计时器是否在走
+bool          autoShutdownTriggered = false; // 自动关机是否已触发 (需 SW3 手动复位)
 
 // ADC 滤波缓冲 (每通道一个)
 #define NTC_FILTER_SIZE 8
@@ -177,13 +185,16 @@ int pidCompute(float temp, float dt) {
     float pTerm = PID_KP * error;
 
     // I: 积分 (条件积分 + 加速回退, 彻底防饱和)
-    //   ① 大误差(>1.5°C, 处于 ramp 阶段) → 不累加, 避免爬升时积分膨胀
-    //   ② 温度超目标(error<0) → 3 倍速衰减, 快速纠正冲温
-    //   ③ 接近目标(0~1.5°C) → 正常累加, 消除稳态误差
-    //   ④ 范围夹到 [0, PWM_NORMAL_ANALOG * 0.5], 积分在稳态承担小份额
-    const float INTEGRAL_MAX = (float)PWM_NORMAL_ANALOG * 0.5f;  // 积分上限 = 63
-    if (error > 1.5f) {
-        // ramp 阶段不积分, 等 P 项主导升温
+    //   ① 大误差(>3°C, 处于 ramp 阶段) → 仍按 30% 折扣累加, 让积分能跟上
+    //   ② 超温(error<0) → 3 倍速衰减积分, 快速纠正冲温
+    //   ③ 接近目标(0~3°C) → 正常累加, 消除稳态误差
+    //   ④ 范围夹到 outMax (与 P 项合并后不超出)
+    const float INTEGRAL_MAX = (float)PWM_NORMAL_ANALOG;  // 积分上限 = full normal output
+    if (error > PWM_BOOST_THRESHOLD) {
+        // ramp 阶段也累加积分 (折半), 避免 P 项被 outMax 限制时仍能继续顶上
+        float tentativeI = pidIntegral + PID_KI * error * dt * 0.5f;
+        if (tentativeI > INTEGRAL_MAX) tentativeI = INTEGRAL_MAX;
+        pidIntegral = tentativeI;
     } else if (error < 0.0f) {
         // 超温: 3 倍速衰减积分, 砍掉 ramp 时拉下的尾巴
         float decay = PID_KI * error * dt * 3.0f;
@@ -277,11 +288,21 @@ void handleButton(uint8_t btnIdx) {
             break;
         }
         case 2: {  // SW3: 切换温控开/关
-            systemEnabled = !systemEnabled;
-            if (!systemEnabled) {
-                analogWrite(HEATER_PIN, 0);   // 关温控时立即停止加热
-                pidOutput = 0;
+            // 若自动关机已触发, 首次按 SW3 用于复位 (清空计时 + 重新启用)
+            if (autoShutdownTriggered) {
+                autoShutdownTriggered = false;
+                heatingAccumMs       = 0;
+                heatingTimerRunning  = false;
+                systemEnabled        = true;
                 pidReset();
+                Serial.println(F("[AUTO-OFF] Reset by SW3, heating time cleared"));
+            } else {
+                systemEnabled = !systemEnabled;
+                if (!systemEnabled) {
+                    analogWrite(HEATER_PIN, 0);   // 关温控时立即停止加热
+                    pidOutput = 0;
+                    pidReset();
+                }
             }
             Serial.print(F(" PowerToggle -> "));
             Serial.println(systemEnabled ? F("ENABLED") : F("DISABLED"));
@@ -589,8 +610,48 @@ void loop() {
     }
 
     // --- 决定是否允许加热 ---
-    // 三个条件都满足才加热: ①系统使能(SW3) ②无传感器故障 ③未在超温锁定
-    bool allowHeat = systemEnabled && !emergency;   // 超温锁定由 pidCompute 内部处理
+    // 四个条件都满足才加热: ①系统使能(SW3) ②无传感器故障 ③未在超温锁定 ④未触发自动关机
+    bool allowHeat = systemEnabled && !emergency && !autoShutdownTriggered;   // 超温锁定由 pidCompute 内部处理
+
+    // ===== 4 小时累计加热时长管理 =====
+    // 上升沿 (false→true): 记录本段加热起始时刻
+    // 下降沿 (true→false): 把本段时长累加进 heatingAccumMs
+    // 每次循环: 若在加热中, 检查总时长是否达到 AUTO_SHUTDOWN_MS
+    static bool prevAllowHeat = false;
+    if (allowHeat && !prevAllowHeat) {
+        heatingStartMs      = now;
+        heatingTimerRunning = true;
+    } else if (!allowHeat && prevAllowHeat) {
+        heatingAccumMs      += (now - heatingStartMs);
+        heatingTimerRunning = false;
+    }
+    prevAllowHeat = allowHeat;
+
+    // 累计加热时长 = 之前累计 + 本段持续 (仅在加热中)
+    unsigned long currentHeatingMs = heatingAccumMs;
+    if (heatingTimerRunning) {
+        currentHeatingMs += (now - heatingStartMs);
+    }
+
+    // 达到 4 小时 → 触发自动关机
+    if (heatingTimerRunning && currentHeatingMs >= AUTO_SHUTDOWN_MS) {
+        // 把本段时长并入累计, 然后停表
+        heatingAccumMs       = currentHeatingMs;
+        heatingTimerRunning  = false;
+        autoShutdownTriggered = true;
+        systemEnabled         = false;   // 立即关温控
+        analogWrite(HEATER_PIN, 0);
+        pidOutput = 0;
+        pidReset();
+        // 蜂鸣器短鸣 3 声提示 (区别于故障长鸣)
+        for (uint8_t i = 0; i < 3; i++) {
+            buzzerShortBeep(200);
+            delay(200);
+        }
+        Serial.print(F("!! AUTO SHUTDOWN: heating reached "));
+        Serial.print(AUTO_SHUTDOWN_MS / 1000UL / 60UL);
+        Serial.println(F(" min. Press SW3 to reset."));
+    }
 
     // --- PID 计算输出 ---
     float dt = (now - pidLastTime) / 1000.0f;
@@ -692,18 +753,19 @@ void loop() {
     display.setCursor(0, 54);
     if (!systemEnabled) {
         display.print(F("POWERED OFF"));
+    } else if (autoShutdownTriggered) {
+        display.print(F("AUTO-OFF 4H! SW3"));
     } else if (emergency) {
         display.print(F("HALT! "));
         display.print(reason);
     } else if (pidOverheatLock) {
         display.print(F("OVERHEAT LOCK"));
     } else {
-        int pct = (pidOutput * 100) / PID_OUTPUT_MAX;  // 当前占空比 / 50%档
+        // 占空比显示: 按 255 为基准 (analogWrite 全量程)
+        int pct = (pidOutput * 100) / 255;
         display.print(F("PWM "));
         display.print(pidOutput);
-        display.print(F("/"));
-        display.print(PID_OUTPUT_MAX);
-        display.print(F(" ("));
+        display.print(F("/255 ("));
         display.print(pct);
         display.print(F("%)"));
     }
