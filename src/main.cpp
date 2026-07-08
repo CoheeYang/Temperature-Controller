@@ -5,18 +5,18 @@
  *   1) OLED 显示 CH1 / CH2 两路温度 (每 500ms 刷新)
  *   2) PID 闭环控制加热膜, 维持目标温度:
  *        引脚 D6 (P7 → U9 → CH4 MOSFET gate), 硬件 PWM ~1kHz
- *        目标温度默认 38°C, 可用按键调节 37~41°C
+ *        目标温度默认 38°C, 可用按键调节 37~43°C
  *        控制温度 = max(CH1, CH2), 任一传感器失效则用另一路
  *        PID 参数 Kp=35.0, Ki=0.8, Kd=25.0 (实测最佳)
  *        PWM 占空比硬上限 = 50% (防止危险过热)
  *   3) 三个按键 (REQUIREMENTS.md §2.6):
- *        SW1=D2  →  目标温度 +0.5°C (上限 41°C)
+ *        SW1=D2  →  目标温度 +0.5°C (上限 43°C)
  *        SW2=D3  →  目标温度 -0.5°C (下限 37°C)
  *        SW3=D4  →  切换 温控开/关 (按一次关闭, 再按启用)
  *        按键带上拉 + 软件消抖 (50ms)
  *   4) 安全保护:
  *        任一 NTC 短路/断路 → 立即切断加热
- *        温度 > 42℃ → 锁定加热, 降到 40℃ 才解锁
+ *        温度 > 62℃ (当前标定阈值) → 锁定加热, 降到 60℃ 才解锁
  *        双 NTC 故障 → 视为超温, 强制停机
  *
  *  串口波特率: 9600
@@ -38,22 +38,25 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 // CH1 接 A0 (P3, R3);  CH2 接 A1 (P2, R4);  CH3=A2(P8); CH4=A3(P9)
 // 分压: VCC - 10k - ADC - NTC - GND
 //        温度↑ → NTC阻值↓ → ADC值↓
+// ⚠️ NTC 实际为 100kΩ@25℃, 但 PCB 上分压电阻 R3/R4 仍是 10kΩ (硬件焊死)
+//    → ADC 工作点偏高 (室温下 ≈930), 精度受限但可正常测温
 #define NTC_CH_COUNT    2                          // 当前启用 2 路
 const uint8_t NTC_PINS[NTC_CH_COUNT] = { A0, A1 }; // P3=CH1, P2=CH2
 const char*   NTC_NAMES[NTC_CH_COUNT] = { "CH1", "CH2" };
 
-#define NTC_R25         10000.0f  // 25℃ 标称阻值 (Ω)
+#define NTC_R25         100000.0f // 25℃ 标称阻值 (Ω) —— NTC 实际为 100kΩ@25℃
 #define NTC_B_VALUE     3950.0f   // B 值
-#define NTC_R_REF       10000.0f  // 分压电阻 (Ω)
+#define NTC_R_REF       10000.0f  // 分压电阻 (Ω) —— PCB R3/R4=10kΩ 焊死, 不修改
 #define ADC_SHORT_THRESHOLD  20   // ADC < 20 → 短路
 #define ADC_OPEN_THRESHOLD   1000 // ADC > 1000 → 断路
-#define TEMP_OVERHEAT       62.0f // 超温硬切断阈值 (℃) ⚠️ 标定模式下提高到 62°C, 正常应恢复 42°C
+#define TEMP_OVERHEAT       50.0f // 超温硬切断阈值 (℃) ⚠️ 标定模式 → 50°C (医疗输液场景应使用 42°C)
 
 // ===== 加热控制参数 =====
 // P7 → CH4 → U9(100N03) → D6 (REQUIREMENTS.md 表格确认)
 // D6 是 Arduino Nano 支持硬件 PWM 的引脚 (Timer0 OC0A),
 // 默认频率约 980Hz ≈ 1kHz, 用 analogWrite 直接输出
 #define HEATER_PIN            6       // 加热膜 PWM 引脚 (P7=CH4)
+#define BUZZER_PIN            5       // 蜂鸣器引脚 (D5, BUZZER2: PB-1224PE-05Q 有源, 高电平响)
 // 自适应占空比上限: 误差大时(RAM阶段) 允许更猛, 接近目标时收回防过冲
 #define PWM_BOOST_THRESHOLD   2.0f    // 误差≥2°C 时启动 boost
 #define PWM_NORMAL_PERCENT    50      // 稳态占空比上限 (防过冲危险)
@@ -70,12 +73,10 @@ const char*   NTC_NAMES[NTC_CH_COUNT] = { "CH1", "CH2" };
 #define PID_OUTPUT_MAX     PID_OUTPUT_NORMAL  // 文档/老代码兼容 (实际可放宽见 pidCompute)
 
 // ===== 目标温度 (变量, 可被按键修改) =====
-// ⚠️ 标定实验模式: 范围扩大到 37~60°C (临时, 用于实测"瓶身→瓶口"温度补偿 offset)
-//    标定方法: 外接温度计查瓶口实际温度, 与 PID 稳态 setpoint 对比,
-//              取多组数据拟合 offset = T瓶口 - T瓶身NTC
-//    标定完成后应恢复到 37~41°C, 把offset 硬编码进 adcToTempC
+// 调温范围 37~49°C, 步进 0.5°C, 默认 38°C
+// (49°C 上限用于加热膜实验, 必须低于超温阈值 TEMP_OVERHEAT=50°C 至少 1°C)
 #define TEMP_MIN         37.0f
-#define TEMP_MAX         60.0f     // ⚠️ 标定模式上限扩大至 60°C
+#define TEMP_MAX         49.0f     // 调温上限 (必须 < TEMP_OVERHEAT=50°C 留安全余量)
 #define TEMP_STEP        0.5f
 #define TEMP_DEFAULT     38.0f
 float  tempSetpoint = TEMP_DEFAULT;   // 当前目标温度 (按键可调)
@@ -95,6 +96,7 @@ float         pidIntegral   = 0.0f;   // 积分累计 (带抗饱和)
 float         pidLastError  = 0.0f;   // 上次误差 (微分先行)
 int           pidOutput     = 0;      // PID 当前输出 (0~127)
 bool          pidOverheatLock = false; // 超温锁定 (需降温才解锁)
+bool          alarmActive     = false; // 运行期报警活跃标志 (传感器故障/超温), 联动蜂鸣器
 unsigned long pidLastTime  = 0;      // 上次 PID 计算时刻
 
 // 温控使能开关 (SW3 切换)
@@ -146,11 +148,11 @@ float adcToTempC(int adc) {
  * PID 计算: 返回 PWM 输出值 (0~127)
  *   - 目标温度 = TEMP_SETPOINT
  *   - 输入 = 当前温度, dt = 时间间隔(秒)
- *   - 超温 (>42℃) 锁定: 输出强制 0, 直到温度降到 40℃ 以下解锁
+ *   - 超温 (>50℃) 锁定: 输出强制 0, 直到温度降到 48℃ 以下解锁
  *   - 输出上限 = 127 (PWM 50%), 抗积分饱和
  * ============================================================== */
 int pidCompute(float temp, float dt) {
-    // 超温锁定机制 (迟滞: 上限 42℃ 触发, 下限 40℃ 解锁)
+    // 超温锁定机制 (迟滞: 上限 50℃ 触发, 下限 48℃ 解锁)
     if (temp >= TEMP_OVERHEAT) {
         pidOverheatLock = true;
         pidIntegral = 0.0f;
@@ -158,7 +160,7 @@ int pidCompute(float temp, float dt) {
     }
     if (pidOverheatLock) {
         if (temp < (TEMP_OVERHEAT - 2.0f)) {
-            pidOverheatLock = false;   // 温度回落到 40℃ → 解锁
+            pidOverheatLock = false;   // 温度回落到 48℃ → 解锁
         } else {
             return 0;                  // 锁定期间输出 0
         }
@@ -312,25 +314,166 @@ void scanI2C() {
 }
 
 /* ================================================================
+ * 蜂鸣器控制 (BUZZER2 = PB-1224PE-05Q, 有源蜂鸣器, 高电平响)
+ *   - buzzerOn()     : 持续鸣响
+ *   - buzzerOff()    : 停止鸣响
+ *   - buzzerShortBeep(): 鸣响 ms 毫秒后自动停止
+ * ============================================================== */
+void buzzerOn()              { digitalWrite(BUZZER_PIN, HIGH); }
+void buzzerOff()             { digitalWrite(BUZZER_PIN, LOW);  }
+void buzzerShortBeep(uint16_t ms) {
+    buzzerOn();
+    delay(ms);
+    buzzerOff();
+}
+
+/* ================================================================
+ * 上电自检 (Power-On Self-Test, POST)
+ *   流程:
+ *     (1) 蜂鸣器硬件自检: 响 200ms
+ *     (2) 依次扫描 NTC 各通道: ADC 阈值检查 (短路<20 / 断路>1000)
+ *     (3) 任一通道故障 → 蜂鸣器长鸣报警 + OLED 故障页 + 死循环
+ *     (4) 全部正常 → 蜂鸣器鸣一声 200ms 示意 OK
+ *   返回: 无 (故障时永不返回, 进入死循环)
+ * ============================================================== */
+void powerOnSelfTest() {
+    Serial.println(F("\n=== Power-On Self-Test ==="));
+
+    // --- 上电瞬间强制关断加热 (POST 期间不允许加热) ---
+    pinMode(BUZZER_PIN, OUTPUT);
+    buzzerOff();
+    analogWrite(HEATER_PIN, 0);
+
+    // (1) 蜂鸣器硬件自检声
+    Serial.println(F("[POST] Buzzer test..."));
+    buzzerShortBeep(200);
+    delay(80);
+
+    // (2) NTC 温度传感器 + 线路短路/断路检测
+    delay(100);  // 等待 ADC 稳定
+
+    bool faultFound = false;
+    int  faultCh    = -1;
+    int  faultKind  = 0;
+    int  faultAdc   = 0;
+
+    for (uint8_t ch = 0; ch < NTC_CH_COUNT; ch++) {
+        // 4 连采取平均, 抗噪
+        unsigned long sum = 0;
+        for (int i = 0; i < 4; i++) sum += analogRead(NTC_PINS[ch]);
+        int adc = (int)(sum >> 2);
+
+        int kind = checkNtc(adc);
+        Serial.print(F("[POST] "));
+        Serial.print(NTC_NAMES[ch]);
+        Serial.print(F(" ADC="));
+        Serial.print(adc);
+        if (kind == 0) {
+            Serial.println(F(" OK"));
+        } else if (kind == 1) {
+            Serial.println(F(" SHORT!"));
+        } else {
+            Serial.println(F(" OPEN!"));
+        }
+
+        if (kind != 0) {
+            faultFound = true;
+            faultCh    = (int)ch;
+            faultKind  = kind;
+            faultAdc   = adc;
+            break;   // 故障只需报首路
+        }
+    }
+
+    // (3) 任一通道故障: 蜂鸣器长鸣 + OLED 报警 + 死循环
+    if (faultFound) {
+        const char* faultName = (faultKind == 1) ? "SHORT!" : "OPEN!";
+        Serial.print(F("!! POST FAILED: "));
+        Serial.print(NTC_NAMES[faultCh]);
+        Serial.print(F(" ADC="));
+        Serial.print(faultAdc);
+        Serial.print(F(" -> "));
+        Serial.println(faultName);
+
+        display.clearDisplay();
+        display.setTextColor(SSD1306_WHITE);
+        display.setTextSize(1);
+
+        display.setCursor(28, 0);
+        display.println(F("!!! ALARM !!!"));
+        display.setCursor(20, 14);
+        display.println(F("POST FAILED"));
+
+        display.setCursor(0, 30);
+        display.print(F("CH"));
+        display.print(faultCh + 1);
+        display.print(F("  "));
+        display.println(faultName);
+
+        display.setCursor(0, 42);
+        display.print(F("ADC="));
+        display.println(faultAdc);
+
+        display.setCursor(0, 56);
+        display.println(F("CHECK WIRING!"));
+        display.display();
+
+        // 蜂鸣器长鸣报警 (持续鸣响, 不退出)
+        Serial.println(F("!! BUZZER ALARM ON (continuous)"));
+        while (true) {
+            buzzerOn();   // 长鸣报警
+        }
+    }
+
+    // (4) 全部通过: 蜂鸣器响一声 (200ms) 示意正常
+    Serial.println(F("[POST] ALL CHANNELS OK"));
+    buzzerShortBeep(200);
+
+    // OLED 显示自检通过提示
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(2);
+    display.setCursor(30, 18);
+    display.print(F("SELF TEST"));
+    display.setCursor(48, 40);
+    display.print(F("OK"));
+    display.display();
+    delay(800);
+
+    Serial.println(F("=== POST PASSED, entering main loop ===\n"));
+}
+
+/* ================================================================
  * 初始化
  * ============================================================== */
 void setup() {
     Serial.begin(9600);
-    while (!Serial);              // 等待串口就绪
+    // ⚠️ 原 while(!Serial) 在独立供电(不连电脑串口)时永远阻塞, 导致 OLED/蜂鸣器
+    // 初始化代码根本无法执行 -> 表现为"完全没反应"
+    // 替换为启动延时, 让 USB-CDC 有时间初始化但不阻塞
+    delay(300);
 
-    Serial.println(F("\n=== OLED Minimal Test ==="));
+    Serial.println(F("\n=== Boot (NTC Temp Control v2) ==="));
 
-    // --- Step 1: I2C 扫描 ---
+    // --- 预先初始化蜂鸣器引脚 (OLED 失败时用于报警提示) ---
+    pinMode(BUZZER_PIN, OUTPUT);
+    buzzerOff();
+
+    // --- Step 1: I2C 扫描 (诊断用, 即使没找到 OLED 也不阻塞) ---
     Wire.begin();
+    Wire.setWireTimeout(2000, true);   // 2s 超时, 避免 SSD1306 未上电时 endTransmission 死等
     scanI2C();
 
-    // --- Step 2: 初始化 OLED ---
+    // --- Step 2: 初始化 OLED (失败则蜂鸣器长鸣 + 死循环提示) ---
     Serial.println(F("Initializing SSD1306 @ 0x3C..."));
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
         Serial.println(F("!! SSD1306 init FAILED"));
         Serial.println(F("   If I2C scan found 0x3C, check reset pin / power."));
-        Serial.println(F("   Program will hang here."));
-        while (true) { delay(1000); }
+        Serial.println(F("   Program will hang with buzzer alarm."));
+        while (true) {
+            buzzerOn();      // OLED 失败: 蜂鸣器长鸣报警 (让用户知道设备未正常启动)
+            delay(1000);
+        }
     }
     Serial.println(F("SSD1306 init OK!"));
 
@@ -356,6 +499,9 @@ void setup() {
     Serial.print(F(" Kd=")); Serial.println(PID_KD);
     pidLastTime = millis();
 
+    // --- 上电自检 (蜂鸣器+NTC短路/断路检测, 失败则死循环长鸣报警) ---
+    powerOnSelfTest();
+
     // --- 显示固定标题 ---
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
@@ -375,7 +521,8 @@ void setup() {
 /* ================================================================
  * 主循环
  *   加热: 硬件 PWM (~1kHz) 全程自动输出, 这里只在故障时拉低关断
- *   500ms: 读 NTC + 安全检查 + OLED 刷新 + 串口打点
+ *   500ms: 读 NTC + 安全检查 + PID 计算 + OLED 刷新
+ *   10000ms: 串口日志输出 (10s 一次, 便于长时间数据采集)
  * ============================================================== */
 void loop() {
     unsigned long now = millis();
@@ -386,10 +533,14 @@ void loop() {
         handleButton(btn);
     }
 
-    // ============ 每 500ms: 读 NTC + 安全 + 屏幕 ============
+    // ============ 每 500ms: 读 NTC + 安全 + PID + 屏幕 ============
     static unsigned long lastT = 0;
     if (now - lastT < 500) return;
     lastT = now;
+
+    // 串口打点独立节拍 (10s 一次), 与本函数 500ms 节拍分开
+    static unsigned long lastLogT = 0;
+    bool doLog = (now - lastLogT >= 10000);
 
     // --- 读取两路 NTC ---
     int   adcs[NTC_CH_COUNT];
@@ -416,6 +567,12 @@ void loop() {
         heaterOn = false;   // 仅作为本周期标记使用, 保留逻辑兼容
         analogWrite(HEATER_PIN, 0);
         pidReset();
+        // 蜂鸣器报警: 运行期检测到传感器故障 → 长鸣报警 (持续到故障排除)
+        if (!alarmActive) {
+            alarmActive = true;
+            buzzerOn();
+            Serial.println(F("!! BUZZER ALARM ON"));
+        }
         Serial.print(F("!! SAFETY TRIP: ")); Serial.println(reason);
     }
 
@@ -439,6 +596,20 @@ void loop() {
     float dt = (now - pidLastTime) / 1000.0f;
     pidLastTime = now;
     if (!emergency) heaterOn = true;  // 故障恢复后允许加热
+
+    // --- 超温锁定联动蜂鸣器报警 ---
+    // pidCompute() 内部测到超温会设置 pidOverheatLock; 这里同步报警状态
+    if (pidOverheatLock && !alarmActive) {
+        alarmActive = true;
+        buzzerOn();
+        Serial.println(F("!! BUZZER ALARM ON (OVERHEAT)"));
+    }
+    // --- 故障/超温全部解除后关闭蜂鸣器报警 ---
+    if (!emergency && !pidOverheatLock && alarmActive) {
+        alarmActive = false;
+        buzzerOff();
+        Serial.println(F("## BUZZER ALARM OFF (recovered)"));
+    }
     if (allowHeat) {
         pidOutput = pidCompute(controlTemp, dt);
         analogWrite(HEATER_PIN, pidOutput);
@@ -448,30 +619,35 @@ void loop() {
         // 关温控时不重置 PID, 重新启动时Smooth恢复 (可选)
     }
 
-    // --- 串口打点 ---
-    for (uint8_t ch = 0; ch < NTC_CH_COUNT; ch++) {
-        Serial.print(NTC_NAMES[ch]);
-        Serial.print(F(" ADC=")); Serial.print(adcs[ch]);
-        if (faults[ch] == 0) {
-            Serial.print(F(" Temp=")); Serial.print(temps[ch], 2); Serial.println(F("C"));
-        } else if (faults[ch] == 1) {
-            Serial.println(F(" [SHORT!]"));
-        } else {
-            Serial.println(F(" [OPEN!]"));
+    // --- 串口打点 (节流到 10s 一次, 避免长时间记录数据时日志过大) ---
+    if (doLog) {
+        lastLogT = now;
+        // 先打一个时间戳, 便于后来分析
+        Serial.print(F("[t=")); Serial.print(now / 1000); Serial.print(F("s] "));
+        for (uint8_t ch = 0; ch < NTC_CH_COUNT; ch++) {
+            Serial.print(NTC_NAMES[ch]);
+            Serial.print(F(" ADC=")); Serial.print(adcs[ch]);
+            if (faults[ch] == 0) {
+                Serial.print(F(" Temp=")); Serial.print(temps[ch], 2); Serial.print(F("C "));
+            } else if (faults[ch] == 1) {
+                Serial.print(F("[SHORT] "));
+            } else {
+                Serial.print(F("[OPEN] "));
+            }
         }
-    }
-    Serial.print(F("CTRL temp=")); Serial.print(controlTemp, 2);
-    Serial.print(F("C Set=")); Serial.print(tempSetpoint, 1);
-    Serial.print(F(" PID=")); Serial.print(pidOutput);
-    Serial.print(F("/")); Serial.print(PID_OUTPUT_MAX);
-    if (!systemEnabled) {
-        Serial.println(F(" (DISABLED)"));
-    } else if (!heaterOn || emergency) {
-        Serial.print(F(" (HALT: ")); Serial.print(reason); Serial.println(F(")"));
-    } else if (pidOverheatLock) {
-        Serial.println(F(" (OVERHEAT-LOCK)"));
-    } else {
-        Serial.println(F(" (HEATING)"));
+        Serial.print(F("| Ctrl=")); Serial.print(controlTemp, 2);
+        Serial.print(F("C Set=")); Serial.print(tempSetpoint, 1);
+        Serial.print(F(" PWM=")); Serial.print(pidOutput);
+        Serial.print(F("/")); Serial.print(PID_OUTPUT_MAX);
+        if (!systemEnabled) {
+            Serial.println(F(" (DISABLED)"));
+        } else if (!heaterOn || emergency) {
+            Serial.print(F(" (HALT: ")); Serial.print(reason); Serial.println(F(")"));
+        } else if (pidOverheatLock) {
+            Serial.println(F(" (OVERHEAT-LOCK)"));
+        } else {
+            Serial.println(F(" (HEATING)"));
+        }
     }
 
     // --- 刷新 OLED (两路温度 + PID 状态) ---
