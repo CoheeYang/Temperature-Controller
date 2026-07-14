@@ -101,7 +101,8 @@ bool          alarmActive     = false; // 运行期报警活跃标志 (传感器
 unsigned long pidLastTime  = 0;      // 上次 PID 计算时刻
 
 // 温控使能开关 (SW3 切换)
-bool          systemEnabled = true;   // false → 关闭温控 (停止加热, 但仍显示温度)
+// ⚠️ 开机默认待机 (false): 设备上电后不加热, 仅显示温度, 需按 SW3 才启动温控
+bool          systemEnabled = false;  // false → 待机 (关闭温控, 停止加热, 但仍显示温度)
 bool          heaterOn      = true;   // 本周期是否真在加热 (用于状态显示和故障检测)
 
 // ===== 4 小时自动关机 (从实际加热开始计时, 加热中断时暂停, 恢复时累加) =====
